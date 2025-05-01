@@ -15,7 +15,7 @@ class MoviesParserPipeline:
         self.file = open('movies_output.csv', 'w', newline='', encoding='utf-8')
         self.writer = csv.writer(self.file)
         # Укажи нужные заголовки, в зависимости от item
-        self.writer.writerow(['title', 'genre', 'director', 'country', 'year'])
+        self.writer.writerow(['title', 'genre', 'director', 'country', 'year', 'imdb'])
 
     def close_spider(self, spider):
         self.file.close()
@@ -27,6 +27,7 @@ class MoviesParserPipeline:
             item.get('genre'),
             item.get('director'),
             item.get('country'),
-            item.get('year')
+            item.get('year'),
+            item.get('imdb')
         ])
         return item
