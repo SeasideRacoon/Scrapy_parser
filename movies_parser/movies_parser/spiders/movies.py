@@ -1,3 +1,4 @@
+import json
 import re
 import ast
 import scrapy
@@ -6,11 +7,12 @@ from collections import deque
 
 class MoviesSpider(scrapy.Spider):
     name = "movies"
-    allowed_domains = ["ru.wikipedia.org"]
+    allowed_domains = ["ru.wikipedia.org", "imdb.com"]
 
     def start_requests(self):
         url = "https://ru.wikipedia.org/wiki/%D0%9A%D0%B0%D1%82%D0%B5%D0%B3%D0%BE%D1%80%D0%B8%D1%8F:%D0%A4%D0%B8%D0%BB%D1%8C%D0%BC%D1%8B_%D0%BF%D0%BE_%D0%B3%D0%BE%D0%B4%D0%B0%D0%BC"
-        yield scrapy.Request(url=url, callback=self.parse)
+        yield scrapy.Request(url=url, callback=self.parse,
+                             headers={'Use-Agent':'Mozilla/5.0'})
 
         # Используем очередь как в BFS
 
@@ -49,12 +51,7 @@ class MoviesSpider(scrapy.Spider):
             next_url = self.queue.popleft()
             yield scrapy.Request(next_url, callback=self.parse_bfs)
 
-        print(
-            '----------------------------------------------------------------------------------------------------------')
         next_page_href = response.css('#mw-pages a').xpath('./text()[.="Следующая страница"]/../@href').extract_first()
-        print(
-            '-------------------------------------------------------next_page'
-            '-----------------------------------------------')
         if next_page_href:
             yield response.follow(next_page_href, callback=self.parse)
         full_url = response.urljoin(next_page_href)
@@ -126,12 +123,15 @@ class MoviesSpider(scrapy.Spider):
             c = re.sub(r'\[.*?\]', '', c)
             c = c.strip()
 
-            # Убираем одиночные цифры или мусор
-            if re.fullmatch(r'\d+', c):
+            # Убираем одиночные цифры, символы типа "~", мусор
+            if re.fullmatch(r'[\d~\-\+]+', c):
                 continue
 
-            # Убираем пустые или невалидные записи вроде [, ]
+            # Убираем пустые или невалидные записи вроде ",", "[]", и тому подобное
             if re.fullmatch(r'[\[\],\s]*', c):
+                continue
+
+            if re.match(r'\s*(ок\.?|ОК|~|≈)', c):
                 continue
 
             # Обрабатываем символ "/" как разделитель стран
@@ -140,9 +140,11 @@ class MoviesSpider(scrapy.Spider):
                 cleaned_list.extend(parts)
             else:
                 # Убираем лишние скобки
-                c = re.sub(r'^\s*\(.*\)\s*$', '', c)  # Удаляем строку типа "( Веймарская республика )"
+                c = re.sub(r'^\s*\($', '', c)
+                c = re.sub(r'^\s*\)$', '', c)
                 if c:
                     cleaned_list.append(c)
+
 
         # Склеиваем через запятую
         country = ', '.join(cleaned_list)
@@ -210,7 +212,6 @@ class MoviesSpider(scrapy.Spider):
         return genre
 
     def parse_movie(self, response):
-        self.logger.info("========================parse_called===============================================")
 
         infobox = response.css('table.infobox')
         if infobox:
@@ -220,7 +221,6 @@ class MoviesSpider(scrapy.Spider):
             else:
                 title = None
 
-            print(f"Title: {title}")
 
             # Выбираем первый элемент из найденных
             selector = infobox[0]  # берём только первый infobox
@@ -228,6 +228,7 @@ class MoviesSpider(scrapy.Spider):
             genre = []
             country = []
             year = []
+            imdb = None
 
             # Обрабатываем строки таблицы
             for row in selector.css('tr'):
@@ -242,14 +243,33 @@ class MoviesSpider(scrapy.Spider):
                     director.extend(director_list)  # Добавляем в список всех режиссёров
 
                 if header_genre and 'Жанр' in header_genre:
+                    # Пытаемся вытащить жанры из ссылок
                     genre_list = row.css('td a::text').getall()
-                    genre_list = [c.strip() for c in genre_list if c.strip()]
-                    genre.extend(genre_list)  # Добавляем все жанры
+                    genre_list = [g.strip() for g in genre_list if g.strip()]
+
+                    # Если в ссылках ничего нет — пробуем весь текст
+                    if not genre_list:
+                        genre_list = row.css('td *::text').getall()
+                        genre_list = [g.strip() for g in genre_list if g.strip()]
+
+                    genre.extend(genre_list)
 
                 if header and ('Страна' in header or 'Страны' in header):
+                    # Первый способ: общий сбор текста
                     country_list = row.css('td *::text').getall()
                     country_list = [c.strip() for c in country_list if c.strip()]
-                    country.extend(country_list)  # Добавляем все страны
+
+                    # Если не сработало — fallback на все span теги
+                    if not country_list:
+                        country_list = row.css('td span span *::text').getall()
+                        country_list = [c.strip() for c in country_list if c.strip()]
+
+                        # Если не сработало — fallback на <a> теги
+                        if not country_list:
+                            country_list = row.css('td span span *::text').getall()
+                            country_list = [c.strip() for c in country_list if c.strip()]
+
+                    country.extend(country_list)
 
                 if header and (
                         'Год' in header or 'Дата Выхода' in header or 'Дата выхода' in header or 'Премьера' in header):
@@ -264,12 +284,55 @@ class MoviesSpider(scrapy.Spider):
             country = self.clean_country(country)
             year = self.clean_year(year)
 
-            # Возвращаем собранные данные и выходим из метода
-            yield {
-                "title": title,
-                "director": director,
-                "genre": genre,
-                "country": country,
-                "year": year
-            }
+            # Ищем ссылку на IMDb
+
+            imdb_url = response.css('th a[title="Internet Movie Database"]')
+            if imdb_url:
+                imdb_link = response.css('td a::attr(href)').re_first(r'https://www.imdb.com/title/tt\d+/')
+                if imdb_link:
+                    yield scrapy.Request(
+                        url=imdb_link,
+                        callback=self.parse_imdb,
+                        meta={
+                            'wikipedia_data': {
+                                'title': title,
+                                'genre': genre,
+                                'director': director,
+                                'country': country,
+                                'year': year
+                            }
+                        },
+                        headers={'User-Agent': 'Mozilla/5.0'}
+                    )
+                else:
+                    # Если ссылки нет, просто выдаём данные с Википедии
+                    yield {
+                        "title": title,
+                        "genre": genre,
+                        "director": director,
+                        "country": country,
+                        "year": year,
+                        "imdb": None
+                    }
+
             return  # Прерываем дальнейшую обработку для этой страницы
+
+
+    def parse_imdb(self, response):
+        rating = None
+        wiki_data = response.meta['wikipedia_data']
+        try:
+            script_data = response.xpath('//script[@type="application/ld+json"]/text()').get()
+            json_data = json.loads(script_data)
+            rating = json_data.get('aggregateRating', {}).get('ratingValue')
+        except Exception as e:
+            self.logger.error(f"Ошибка при извлечении рейтинга: {e}")
+
+        yield {
+            "title": wiki_data["title"],
+            "genre": wiki_data["genre"],
+            "director": wiki_data["director"],
+            "country": wiki_data["country"],
+            "year": wiki_data["year"],
+            "imdb": rating
+        }
